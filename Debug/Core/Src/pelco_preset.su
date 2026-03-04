@@ -1,0 +1,7 @@
+../Core/Src/pelco_preset.c:14:13:FLASH_WritePresetTable	72	static
+../Core/Src/pelco_preset.c:52:13:FLASH_LoadPresetTable	32	static
+../Core/Src/pelco_preset.c:81:6:STEPPER_PRESET_Init	8	static
+../Core/Src/pelco_preset.c:88:6:STEPPER_SET_PRESET	16	static
+../Core/Src/pelco_preset.c:100:6:STEPPER_CLEAR_PRESET	16	static
+../Core/Src/pelco_preset.c:110:6:STEPPER_GOTO_PRESET	32	static
+../Core/Src/pelco_preset.c:132:6:STEPPER_GOTO_POS	32	static
