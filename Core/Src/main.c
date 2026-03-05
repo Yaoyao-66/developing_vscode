@@ -54,9 +54,10 @@ UART_HandleTypeDef huart3;
 
 volatile uint8_t PTZ_Busy = 0;
 uint8_t uart_rx_byte;//单个字节接收缓冲位置
-uint8_t frame_pos = 0;//接收过程种数据的位置
-uint8_t pelco_frame_ready = 0;//接收完毕标志
-uint8_t S_RxData[PELCO_FRAME_LEN];//
+volatile uint8_t frame_pos = 0;//接收过程种数据的位置
+volatile uint8_t pelco_frame_ready = 0;//接收完毕标志
+uint8_t pelco_rx_build[PELCO_FRAME_LEN] = {0};
+uint8_t S_RxData[PELCO_FRAME_LEN];//完整帧缓存
 uint8_t S_TxData[7];
 uint8_t S_address;
 uint8_t S_command_H;
@@ -92,7 +93,7 @@ static void MX_USART1_UART_Init(void);
 static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
 
-PelcoCmd Pelco_Parse(uint8_t cmd1, uint8_t cmd2)
+PelcoCmd Pelco_Parse(uint8_t cmd1, uint8_t cmd2, uint8_t data1, uint8_t data2)
 {
     //镜头以及光圈的控制
     if (cmd2 == PELCO_CMD2_ZOOM_TELE) {lens_auto_fz = 0;return PELCO_ZOOM_TELE;}
@@ -103,8 +104,11 @@ PelcoCmd Pelco_Parse(uint8_t cmd1, uint8_t cmd2)
 
     if (cmd1 == PELCO_CMD1_IRIS_OPEN) {lens_auto_fz = 0;return PELCO_IRIS_OPEN;}
     if (cmd1 == PELCO_CMD1_IRIS_CLOSE) {lens_auto_fz = 0;return PELCO_IRIS_CLOSE;}
-    //这里还需要增加变焦镜头的停止相关条件,这段代码导致没有松手停止电机转动
-    if ((cmd1 == PELCO_CMD1_CMD2_FZ_STOP)|| (cmd2 == PELCO_CMD1_CMD2_FZ_STOP)){lens_auto_fz = 1;return PELCO_ALL_STOP;}
+    // 仅在镜头控制位和数据都清零时判定为停止，避免误把普通 PTZ 命令识别为 STOP
+    if ((cmd1 == 0x00U) && (cmd2 == 0x00U) && (data1 == 0x00U) && (data2 == 0x00U)) {
+        lens_auto_fz = 1;
+        return PELCO_ALL_STOP;
+    }
 
     //电机方向的控制
     //较小范围的条件判断放前面
@@ -141,6 +145,16 @@ void FZ_SelfTest_And_Center()
 	PTZ_Busy = 1;   // 禁用串口指令处理（之前我教你的标志位）
 	STEPPER_AUTO_FZ_CENTER();
 	PTZ_Busy = 0;   // 恢复串口指令处理
+}
+
+
+void Lens_SelfTest_And_Init(void)
+{
+    PTZ_Busy = 1;
+    STEPPER_AUTO_FZ_CENTER();
+    PTZ_Busy = 0;
+
+    Lens_Init();
 }
 
 void calculate_checksum(uint8_t *data){
@@ -262,8 +276,7 @@ int main(void)
   //PTZ_SelfTest_And_Center();
   HAL_GPIO_WritePin(GPIOC,GPIO_PIN_13, GPIO_PIN_RESET);//关闭指示灯
   //STEPPER_PRESET_Init();
-  FZ_SelfTest_And_Center();
-  Lens_Init();
+  Lens_SelfTest_And_Init();
 
 
   /* USER CODE END 2 */
@@ -283,14 +296,14 @@ int main(void)
 		  S_data_H    = S_RxData[4];
 		  S_data_L    = S_RxData[5];
 		  S_checksum  = S_RxData[6];
-		  if(check_sum(S_command_H,S_command_L,S_data_H,S_data_L, SLAVE_ADRESS1) == S_checksum)
+		  if(check_sum(S_command_H,S_command_L,S_data_H,S_data_L, S_address) == S_checksum)
 		  {
 			  if(S_address == SLAVE_ADRESS1)  //常规pelco-d的命令，地址1
 			  {
 				  //HAL_UART_Transmit_IT(&huart3, S_RxData, sizeof(S_RxData));//与摄像头串口通讯，也做485复用
 				  HAL_UART_Transmit_IT(&huart1, S_RxData, sizeof(S_RxData));//单独的调试串口
 				  //以下检查云台的控制
-				  switch(Pelco_Parse(S_command_H, S_command_L))
+				  switch(Pelco_Parse(S_command_H, S_command_L, S_data_H, S_data_L))
 				  {
 					  case PELCO_PAN_LEFT:
 						  S_Step_direction = DIR_CCW;
@@ -348,15 +361,13 @@ int main(void)
 					  case PELCO_PAN_TILT_CENTER:
 						  PTZ_SelfTest_And_Center();
 						  break;
-							  case PELCO_ALL_STOP:
+						  case PELCO_ALL_STOP:
 						  STEPPER_Stop(STEPPER_MOTOR1); // 停止运行
 						  STEPPER_Stop(STEPPER_MOTOR2); // 停止运行
 						  Lens_Stop();
 						  break;
 					  case PELCO_UNMATCH_CMD:
-						  STEPPER_Stop(STEPPER_MOTOR1); // 停止运行
-						  STEPPER_Stop(STEPPER_MOTOR2); // 停止运行
-						  Lens_Stop();
+						  // 未匹配命令不改变当前运动状态，避免误停
 						  break;
 					//以下检测lens的控制
 					  case PELCO_ZOOM_TELE:
@@ -378,6 +389,7 @@ int main(void)
 						  //Iris_Close();
 						  break;
 					  case PELCO_FZ_STOP:
+						  Lens_Stop();
 						  break;
 
 					  //预置点
@@ -801,30 +813,42 @@ static void MX_GPIO_Init(void)
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
+    (void)Size;
+
     if (huart->Instance == USART3)
     {
-    	/* 如果PTZ正在自检，则丢弃所有串口数据 */
-		if (PTZ_Busy)
-		{
-			frame_pos = 0;
-			pelco_frame_ready = 0;
-			HAL_UARTEx_ReceiveToIdle_IT(&huart3, &uart_rx_byte, 1);
-			return;
-		}
-    	if ((uart_rx_byte == 0xFF)&&(frame_pos > 0))   // 检测到帧头标志
+        /* 如果 PTZ 正在自检，或上一帧尚未处理完成，则丢弃当前字节 */
+        if (PTZ_Busy || pelco_frame_ready)
         {
+            frame_pos = 0;
+            HAL_UARTEx_ReceiveToIdle_IT(&huart3, &uart_rx_byte, 1);
+            return;
+        }
+
+        if (frame_pos == 0)
+        {
+            /* 帧首必须是 0xFF */
+            if (uart_rx_byte != 0xFF)
+            {
+                HAL_UARTEx_ReceiveToIdle_IT(&huart3, &uart_rx_byte, 1);
+                return;
+            }
+        }
+        else if (uart_rx_byte == 0xFF)
+        {
+            /* 中途出现新帧头，丢弃旧半帧，重新对齐 */
             frame_pos = 0;
         }
 
-        // 存入消息数组种
-        S_RxData[frame_pos++] = uart_rx_byte;
+        pelco_rx_build[frame_pos++] = uart_rx_byte;
 
-        // 达到7字节
         if (frame_pos >= PELCO_FRAME_LEN)
         {
+            memcpy(S_RxData, pelco_rx_build, PELCO_FRAME_LEN);
             frame_pos = 0;
             pelco_frame_ready = 1;
         }
+
         HAL_UARTEx_ReceiveToIdle_IT(&huart3, &uart_rx_byte, 1);
     }
 }
