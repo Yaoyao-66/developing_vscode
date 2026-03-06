@@ -378,6 +378,7 @@ int main(void)
 						  //Iris_Close();
 						  break;
 					  case PELCO_FZ_STOP:
+
 						  break;
 
 					  //预置点
